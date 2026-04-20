@@ -1,0 +1,14 @@
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python train.py \
+  -s "../data/figurines" \
+  -m "../output/figurines/cobgs/4171800" \
+  --include_mask \
+  --finetune_mask \
+  --mask_mode multi_label \
+  --mask_root "../data/figurines/object_mask" \
+  --object_order label_asc \
+  --enable_object_postprocess \
+  --object_debug_views 00010.jpg,00062.jpg,00185.jpg \
+  --object_postprocess_dilation_voxels 2 \
+  --object_postprocess_mask_thresh 0.0 \
+  --object_postprocess_voxel_scale 3.0 \
+  --start_checkpoint "../output/figurines/cobgs/4171800/chkpnt30000.pth" 

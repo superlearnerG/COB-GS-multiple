@@ -40,11 +40,28 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
 
+        use_depth_loss = getattr(args, "use_depth_loss", False)
+        depth_scale = getattr(args, "depth_scale", 0.0)
         if os.path.exists(os.path.join(args.source_path, "sparse")):
-            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.depths, args.eval, args.train_test_exp)
+            scene_info = sceneLoadTypeCallbacks["Colmap"](
+                args.source_path,
+                args.images,
+                args.depths,
+                args.eval,
+                args.train_test_exp,
+                use_depth_loss,
+                depth_scale,
+            )
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
-            scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.depths, args.eval)
+            scene_info = sceneLoadTypeCallbacks["Blender"](
+                args.source_path,
+                args.white_background,
+                args.depths,
+                args.eval,
+                use_depth_loss,
+                depth_scale,
+            )
         else:
             assert False, "Could not recognize scene type!"
 

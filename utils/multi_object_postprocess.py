@@ -1,5 +1,6 @@
 import os
 from collections import deque
+from pathlib import Path
 
 import torch
 import torchvision
@@ -18,11 +19,16 @@ def _parse_debug_view_names(raw_names):
     seen = set()
     for raw_name in str(raw_names).split(","):
         name = raw_name.strip()
-        if not name or name in seen:
+        key = _debug_view_key(name)
+        if not name or key in seen:
             continue
         requested_names.append(name)
-        seen.add(name)
+        seen.add(key)
     return requested_names
+
+
+def _debug_view_key(image_name):
+    return Path(os.path.basename(str(image_name).strip())).stem
 
 
 def resolve_debug_views(scene, raw_names):
@@ -30,25 +36,28 @@ def resolve_debug_views(scene, raw_names):
     if not requested_names:
         return []
 
-    cameras_by_name = {}
+    cameras_by_basename = {}
     for camera in scene.getTrainCameras() + scene.getTestCameras():
-        cameras_by_name.setdefault(camera.image_name, []).append(camera)
+        cameras_by_basename.setdefault(_debug_view_key(camera.image_name), []).append(camera)
 
-    duplicate_names = [name for name in requested_names if len(cameras_by_name.get(name, [])) > 1]
+    duplicate_names = [
+        name for name in requested_names
+        if len(cameras_by_basename.get(_debug_view_key(name), [])) > 1
+    ]
     if duplicate_names:
         raise ValueError(
-            "Debug view names must be unique across train/test cameras. "
+            "Debug view basenames must be unique across train/test cameras. "
             f"Duplicated matches: {duplicate_names}"
         )
 
-    missing_names = [name for name in requested_names if name not in cameras_by_name]
+    missing_names = [name for name in requested_names if _debug_view_key(name) not in cameras_by_basename]
     if missing_names:
         raise ValueError(
             "Requested debug views were not found in the loaded cameras: "
             f"{missing_names}"
         )
 
-    return [cameras_by_name[name][0] for name in requested_names]
+    return [cameras_by_basename[_debug_view_key(name)][0] for name in requested_names]
 
 
 def _support_offsets(radius):

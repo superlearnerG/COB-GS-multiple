@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import re
 
 import cv2
 import numpy as np
@@ -14,7 +15,7 @@ def parse_target_labels(target_labels):
     target_labels = str(target_labels).strip()
     if not target_labels:
         return []
-    return [int(label.strip()) for label in target_labels.split(",") if label.strip()]
+    return [int(label) for label in re.split(r"[\s,]+", target_labels) if label]
 
 
 class BaseMaskProvider:
@@ -147,6 +148,10 @@ class MultiLabelMaskProvider(BaseMaskProvider, _MaskCacheMixin):
             raise ValueError("MultiLabelMaskProvider requires an explicit raw label.")
         binary_mask = self._get_resized_mask(viewpoint) == int(label)
         return self._to_tensor(binary_mask)
+
+    def get_label_map(self, viewpoint):
+        label_map = self._get_resized_mask(viewpoint).astype(np.int64)
+        return torch.from_numpy(label_map).unsqueeze(0).cuda()
 
     def get_object_labels(self):
         return list(self.object_labels)

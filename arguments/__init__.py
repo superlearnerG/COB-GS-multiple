@@ -56,6 +56,8 @@ class ModelParams(ParamGroup):
         self.target_labels = ""
         self.object_order = "area_desc"
         self._depths = ""
+        self.use_depth_loss = False
+        self.depth_scale = 0.0
         self._resolution = -1
         self._white_background = False
         self.train_test_exp = False
@@ -75,6 +77,8 @@ class ModelParams(ParamGroup):
             # g.mask_path = os.path.join(g.model_path, "train/ours_22x/mask_renders", args.text)
         else:
             g.mask_path = None
+        if getattr(g, "use_depth_loss", False) and not getattr(g, "depths", ""):
+            g.depths = "depth"
         return g
 
 class PipelineParams(ParamGroup):
@@ -108,6 +112,7 @@ class OptimizationParams(ParamGroup):
         self.object_postprocess_voxel_scale = 2.0 # 第二重要
         self.object_postprocess_dilation_voxels = 2 # 第三重要
         self.object_postprocess_mask_thresh = 0.05 # 这个最重要
+        self.object_postprocess_skip_labels = ""
         self.object_debug_views = ""
 
         self.scaling_lr = 0.005

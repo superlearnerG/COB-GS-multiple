@@ -13,13 +13,14 @@ import os.path
 import torch
 from torch import nn
 import numpy as np
-from utils.graphics_utils import getWorld2View2, getProjectionMatrix
+from utils.graphics_utils import focal2fov, fov2focal, getWorld2View2, getProjectionMatrixFromIntrinsics
 from utils.general_utils import PILtoTorch
 import cv2
 
 class Camera(nn.Module):
     def __init__(self, resolution, colmap_id, R, T, FoVx, FoVy, depth_params, image, invdepthmap,
                  image_name, uid,
+                 fx=None, fy=None, cx=None, cy=None,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
                  train_test_exp = False, is_test_dataset = False, is_test_view = False
                  ):
@@ -57,25 +58,61 @@ class Camera(nn.Module):
         self.original_image = gt_image.clamp(0.0, 1.0).to(self.data_device)
         self.image_width = self.original_image.shape[2]
         self.image_height = self.original_image.shape[1]
+        self.width = self.image_width
+        self.height = self.image_height
+
+        if fx is None and self.FoVx is not None:
+            fx = fov2focal(self.FoVx, self.image_width)
+        if fy is None and self.FoVy is not None:
+            fy = fov2focal(self.FoVy, self.image_height)
+        if cx is None:
+            cx = float(self.image_width - 1) / 2.0
+        if cy is None:
+            cy = float(self.image_height - 1) / 2.0
+        if fx is None or fy is None:
+            raise AttributeError("Camera requires fx/fy or FoVx/FoVy to construct intrinsics.")
+
+        self.fx = float(fx)
+        self.fy = float(fy)
+        self.cx = float(cx)
+        self.cy = float(cy)
+        if self.FoVx is None:
+            self.FoVx = focal2fov(self.fx, self.image_width)
+        if self.FoVy is None:
+            self.FoVy = focal2fov(self.fy, self.image_height)
+        self.intrinsics = torch.tensor(
+            [
+                [self.fx, 0.0, self.cx],
+                [0.0, self.fy, self.cy],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=torch.float32,
+            device=self.data_device,
+        )
 
         self.invdepthmap = None
         self.depth_reliable = False
         if invdepthmap is not None:
-            self.depth_mask = torch.ones_like(self.alpha_mask)
             self.invdepthmap = cv2.resize(invdepthmap, resolution)
-            self.invdepthmap[self.invdepthmap < 0] = 0
-            self.depth_reliable = True
+            if self.invdepthmap.ndim != 2:
+                self.invdepthmap = self.invdepthmap[..., 0]
 
             if depth_params is not None:
                 if depth_params["scale"] < 0.2 * depth_params["med_scale"] or depth_params["scale"] > 5 * depth_params["med_scale"]:
                     self.depth_reliable = False
-                    self.depth_mask *= 0
                 
                 if depth_params["scale"] > 0:
                     self.invdepthmap = self.invdepthmap * depth_params["scale"] + depth_params["offset"]
 
-            if self.invdepthmap.ndim != 2:
-                self.invdepthmap = self.invdepthmap[..., 0]
+            valid_depth = np.isfinite(self.invdepthmap) & (self.invdepthmap > 0.0)
+            self.invdepthmap[~valid_depth] = 0.0
+            self.depth_reliable = bool(np.any(valid_depth))
+            self.depth_mask = torch.from_numpy(valid_depth[None].astype(np.float32)).to(self.data_device) * self.alpha_mask
+            if depth_params is not None and (
+                depth_params["scale"] < 0.2 * depth_params["med_scale"] or depth_params["scale"] > 5 * depth_params["med_scale"]
+            ):
+                self.depth_reliable = False
+                self.depth_mask *= 0
             self.invdepthmap = torch.from_numpy(self.invdepthmap[None]).to(self.data_device)
 
         self.zfar = 100.0
@@ -85,7 +122,16 @@ class Camera(nn.Module):
         self.scale = scale
 
         self.world_view_transform = torch.tensor(getWorld2View2(R, T, trans, scale)).transpose(0, 1).cuda()
-        self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
+        self.projection_matrix = getProjectionMatrixFromIntrinsics(
+            znear=self.znear,
+            zfar=self.zfar,
+            fx=self.fx,
+            fy=self.fy,
+            cx=self.cx,
+            cy=self.cy,
+            width=self.image_width,
+            height=self.image_height,
+        ).transpose(0,1).cuda()
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
 
@@ -113,4 +159,3 @@ class MiniCam:
         self.full_proj_transform = full_proj_transform
         view_inv = torch.inverse(self.world_view_transform)
         self.camera_center = view_inv[3][:3]
-

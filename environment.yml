@@ -18,3 +18,4 @@ dependencies:
     - submodules/fused-ssim
     - opencv-python
     - joblib
+    - pytorch-fid

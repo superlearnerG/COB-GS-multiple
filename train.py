@@ -19,6 +19,7 @@ from random import randint
 
 import numpy as np
 import torch
+import torchvision
 from tqdm import tqdm
 
 from arguments import ModelParams, OptimizationParams, PipelineParams
@@ -27,7 +28,7 @@ from scene import GaussianModel, Scene
 from utils.general_utils import get_expon_lr_func, safe_state
 from utils.image_utils import psnr
 from utils.loss_utils import l1_loss, ssim
-from utils.mask_provider import MultiLabelMaskProvider, SingleTextMaskProvider
+from utils.mask_provider import MultiLabelMaskProvider, SingleTextMaskProvider, parse_target_labels
 from utils.multi_object_postprocess import (
     postprocess_committed_object,
     render_postprocess_debug,
@@ -100,7 +101,7 @@ def build_mask_provider(dataset, scene):
     return SingleTextMaskProvider(dataset.mask_path)
 
 
-def compute_rgb_loss(image, gt_image, render_pkg, viewpoint_cam, depth_l1_weight_value, opt):
+def compute_rgb_loss(image, gt_image, render_pkg, viewpoint_cam, depth_l1_weight_value, opt, use_depth_loss):
     ll1 = l1_loss(image, gt_image)
     if FUSED_SSIM_AVAILABLE:
         ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
@@ -108,16 +109,28 @@ def compute_rgb_loss(image, gt_image, render_pkg, viewpoint_cam, depth_l1_weight
         ssim_value = ssim(image, gt_image)
     loss = (1.0 - opt.lambda_dssim) * ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
-    ll1depth = 0
-    if depth_l1_weight_value > 0 and viewpoint_cam.depth_reliable:
+    ll1depth = 0.0
+    if use_depth_loss and depth_l1_weight_value > 0 and viewpoint_cam.depth_reliable:
         inv_depth = render_pkg["depth"]
         mono_invdepth = viewpoint_cam.invdepthmap.cuda()
         depth_mask = viewpoint_cam.depth_mask.cuda()
-        ll1depth_pure = torch.abs((inv_depth - mono_invdepth) * depth_mask).mean()
+        valid_pixels = depth_mask.sum().clamp_min(1.0)
+        ll1depth_pure = (torch.abs(inv_depth - mono_invdepth) * depth_mask).sum() / valid_pixels
         ll1depth = depth_l1_weight_value * ll1depth_pure
         loss += ll1depth
         ll1depth = ll1depth.item()
     return ll1, loss, ll1depth
+
+
+def compose_gt_with_background(viewpoint_cam, background):
+    gt_image = viewpoint_cam.original_image.cuda()
+    alpha_mask = getattr(viewpoint_cam, "alpha_mask", None)
+    if alpha_mask is None:
+        return gt_image
+
+    alpha = alpha_mask.to(device=gt_image.device, dtype=gt_image.dtype)
+    bg = background.to(device=gt_image.device, dtype=gt_image.dtype).view(3, 1, 1)
+    return gt_image * alpha + (1.0 - alpha) * bg
 
 
 def maybe_handle_viewer(iteration, dataset, pipe, gaussians, background, opt):
@@ -146,11 +159,85 @@ def maybe_handle_viewer(iteration, dataset, pipe, gaussians, background, opt):
             network_gui.conn = None
 
 
+def _view_output_filename(view):
+    image_name = os.path.basename(str(getattr(view, "image_name", "")).strip())
+    if not image_name:
+        raise ValueError("Cannot save render with original filename because view.image_name is empty.")
+    if not os.path.splitext(image_name)[1]:
+        image_name = f"{image_name}.png"
+    return image_name
+
+
+def _view_output_filenames(views, split_name):
+    output_names = [_view_output_filename(view) for view in views]
+    duplicates = sorted({name for name in output_names if output_names.count(name) > 1})
+    if duplicates:
+        raise ValueError(
+            f"Cannot save {split_name} renders with original filenames because duplicate basenames exist: "
+            f"{duplicates}"
+        )
+    return output_names
+
+
+def render_and_evaluate_vanilla_test_set(dataset, opt, pipe, scene, gaussians, background):
+    test_cameras = scene.getTestCameras()
+    if not test_cameras:
+        print("\n[Vanilla Eval] No test cameras found; skipping PSNR/SSIM/LPIPS/FID evaluation.")
+        return
+
+    method_name = f"ours_{opt.iterations}"
+    render_path = os.path.join(scene.model_path, "test", method_name, "renders")
+    gt_path = os.path.join(scene.model_path, "test", method_name, "gt")
+    os.makedirs(render_path, exist_ok=True)
+    os.makedirs(gt_path, exist_ok=True)
+
+    print(f"\n[Vanilla Eval] Rendering {len(test_cameras)} test views to {os.path.join(scene.model_path, 'test', method_name)}")
+    output_names = _view_output_filenames(test_cameras, "vanilla test")
+    with torch.no_grad():
+        for idx, viewpoint in enumerate(tqdm(test_cameras, desc="Rendering vanilla test set")):
+            output_name = output_names[idx]
+            rendering = render(
+                viewpoint,
+                gaussians,
+                pipe,
+                background,
+                opt,
+                use_trained_exp=dataset.train_test_exp,
+                separate_sh=SPARSE_ADAM_AVAILABLE,
+            )["render"]
+            gt_image = compose_gt_with_background(viewpoint, background)
+
+            if dataset.train_test_exp:
+                rendering = rendering[..., rendering.shape[-1] // 2:]
+                gt_image = gt_image[..., gt_image.shape[-1] // 2:]
+
+            torchvision.utils.save_image(torch.clamp(rendering, 0.0, 1.0), os.path.join(render_path, output_name))
+            torchvision.utils.save_image(torch.clamp(gt_image, 0.0, 1.0), os.path.join(gt_path, output_name))
+
+    torch.cuda.empty_cache()
+    from metrics import evaluate as evaluate_metrics
+
+    evaluate_metrics([scene.model_path], method_names=[method_name], compute_fid=True)
+
+
+def ensure_vanilla_eval_dependencies(scene):
+    if not scene.getTestCameras():
+        return
+    try:
+        from pytorch_fid.fid_score import calculate_fid_given_paths  # noqa: F401
+    except ImportError as exc:
+        raise ImportError(
+            "Vanilla test evaluation requires the PyPI package 'pytorch-fid' "
+            "(import name: pytorch_fid). Install it with: python -m pip install pytorch-fid"
+        ) from exc
+
+
 def run_rgb_training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
+    ensure_vanilla_eval_dependencies(scene)
 
     if checkpoint:
         model_params, first_iter = torch.load(checkpoint)
@@ -199,11 +286,16 @@ def run_rgb_training(dataset, opt, pipe, testing_iterations, saving_iterations, 
         visibility_filter = render_pkg["visibility_filter"]
         radii = render_pkg["radii"]
 
-        if viewpoint_cam.alpha_mask is not None:
-            image *= viewpoint_cam.alpha_mask.cuda()
-
-        gt_image = viewpoint_cam.original_image.cuda()
-        ll1, loss, ll1depth = compute_rgb_loss(image, gt_image, render_pkg, viewpoint_cam, depth_l1_weight(iteration), opt)
+        gt_image = compose_gt_with_background(viewpoint_cam, bg)
+        ll1, loss, ll1depth = compute_rgb_loss(
+            image,
+            gt_image,
+            render_pkg,
+            viewpoint_cam,
+            depth_l1_weight(iteration),
+            opt,
+            getattr(dataset, "use_depth_loss", False),
+        )
         loss.backward()
         iter_end.record()
 
@@ -258,6 +350,8 @@ def run_rgb_training(dataset, opt, pipe, testing_iterations, saving_iterations, 
                 print(f"\n[ITER {iteration}] Saving Checkpoint")
                 save_checkpoint(os.path.join(scene.model_path, f"chkpnt{iteration}.pth"), gaussians, iteration, False)
 
+    render_and_evaluate_vanilla_test_set(dataset, opt, pipe, scene, gaussians, background)
+
 
 def run_single_object_stage(dataset, opt, pipe, scene, gaussians, mask_provider, target_label=None, progress_desc="Segmentation progress", tb_writer=None, log_iteration_offset=0, debug_from=-1):
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -300,9 +394,6 @@ def run_single_object_stage(dataset, opt, pipe, scene, gaussians, mask_provider,
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, opt, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
         image = render_pkg["render"]
 
-        if viewpoint_cam.alpha_mask is not None:
-            image *= viewpoint_cam.alpha_mask.cuda()
-
         if mask_state:
             rendered_mask = render_pkg["mask"]
             mask_signals = render_pkg["mask_signals"]
@@ -312,8 +403,16 @@ def run_single_object_stage(dataset, opt, pipe, scene, gaussians, mask_provider,
             loss = loss_mask
             ll1depth = 0
         else:
-            gt_image = viewpoint_cam.original_image.cuda()
-            ll1, loss, ll1depth = compute_rgb_loss(image, gt_image, render_pkg, viewpoint_cam, depth_l1_weight(iteration), opt)
+            gt_image = compose_gt_with_background(viewpoint_cam, bg)
+            ll1, loss, ll1depth = compute_rgb_loss(
+                image,
+                gt_image,
+                render_pkg,
+                viewpoint_cam,
+                depth_l1_weight(iteration),
+                opt,
+                getattr(dataset, "use_depth_loss", False),
+            )
 
         loss.backward()
         iter_end.record()
@@ -410,6 +509,7 @@ def run_multi_object_segmentation(dataset, opt, pipe, n4views, checkpoint, scene
     if opt.object_debug_views and not opt.enable_object_postprocess:
         raise ValueError("Debug postprocess renders require --enable_object_postprocess.")
     debug_views = resolve_debug_views(scene, opt.object_debug_views) if opt.enable_object_postprocess else []
+    skip_postprocess_labels = set(parse_target_labels(getattr(opt, "object_postprocess_skip_labels", "")))
 
     metadata = {
         "scene_type": scene_type,
@@ -423,6 +523,7 @@ def run_multi_object_segmentation(dataset, opt, pipe, n4views, checkpoint, scene
         "committed_count": {},
         "postprocess": {
             "enabled": bool(opt.enable_object_postprocess),
+            "skip_labels": sorted(skip_postprocess_labels),
             "debug_views": [view.image_name for view in debug_views],
             "labels": {},
         },
@@ -454,6 +555,22 @@ def run_multi_object_segmentation(dataset, opt, pipe, n4views, checkpoint, scene
         print(f"[OBJECT {label}] Committed {committed} Gaussians")
 
         if opt.enable_object_postprocess:
+            if int(label) in skip_postprocess_labels:
+                object_count = int((gaussians.get_object_id == int(label)).sum().item())
+                postprocess_stats = {
+                    "object_count_before": object_count,
+                    "object_count_after": object_count,
+                    "floaters_unassigned": 0,
+                    "background_pruned": 0,
+                    "voxel_size": None,
+                    "cleanup_skipped_reason": "label_in_object_postprocess_skip_labels",
+                }
+                metadata["postprocess"]["labels"][str(label)] = postprocess_stats
+                print(f"[OBJECT {label}] Skipping postprocess because label is in --object_postprocess_skip_labels")
+                write_multi_object_metadata(metadata_path, metadata)
+                log_iteration_offset += opt.iterations
+                continue
+
             mask_response = gaussians.get_mask.detach().squeeze().clone()
             postprocess_stats = postprocess_committed_object(
                 gaussians,
@@ -544,7 +661,7 @@ def training_report(tb_writer, iteration, base_num, ll1, loss, l1_loss_fn, elaps
                 psnr_test = 0.0
                 for idx, viewpoint in enumerate(config["cameras"]):
                     image = torch.clamp(render_func(viewpoint, scene.gaussians, *render_args)["render"], 0.0, 1.0)
-                    gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                    gt_image = torch.clamp(compose_gt_with_background(viewpoint, render_args[1]), 0.0, 1.0)
                     if train_test_exp:
                         image = image[..., image.shape[-1] // 2:]
                         gt_image = gt_image[..., gt_image.shape[-1] // 2:]
@@ -595,8 +712,8 @@ if __name__ == "__main__":
     print("Optimizing " + args.model_path)
     safe_state(args.quiet)
 
-    if not args.disable_viewer:
-        network_gui.init(args.ip, args.port)
+    # if not args.disable_viewer:
+    #     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(
         lp.extract(args),

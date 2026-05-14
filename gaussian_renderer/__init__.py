@@ -15,7 +15,20 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, opt, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, gaussian_filter=None, mask_override=None):
+def _camera_tanfov(viewpoint_camera):
+    fx = getattr(viewpoint_camera, "fx", None)
+    fy = getattr(viewpoint_camera, "fy", None)
+    if fx is not None and fy is not None:
+        return (
+            float(viewpoint_camera.image_width) / (2.0 * float(fx)),
+            float(viewpoint_camera.image_height) / (2.0 * float(fy)),
+        )
+    return (
+        math.tan(viewpoint_camera.FoVx * 0.5),
+        math.tan(viewpoint_camera.FoVy * 0.5),
+    )
+
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, opt, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, gaussian_filter=None, mask_override=None, return_alpha=False):
     """
     Render the scene. 
     
@@ -31,8 +44,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         pass
 
     # Set up rasterization configuration
-    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
-    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+    tanfovx, tanfovy = _camera_tanfov(viewpoint_camera)
+
+    include_mask = bool(getattr(opt, "include_mask", False)) or bool(return_alpha)
 
     raster_settings = GaussianRasterizationSettings(
         image_height=int(viewpoint_camera.image_height),
@@ -48,7 +62,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         prefiltered=False,
         debug=pipe.debug,
         antialiasing=pipe.antialiasing,
-        include_mask=opt.include_mask
+        include_mask=include_mask
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
@@ -92,8 +106,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     else:
         colors_precomp = override_color
 
-    if opt.include_mask:
-        if mask_override is None:
+    if include_mask:
+        if return_alpha:
+            mask_precomp = torch.ones((means3D.shape[0],), dtype=opacity.dtype, device=opacity.device)
+        elif mask_override is None:
             mask_precomp = pc.get_mask if gaussian_filter is None else pc.get_mask[gaussian_filter]
         else:
             mask_precomp = mask_override
@@ -145,7 +161,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # They will be excluded from value updates used in the splitting criteria.
     rendered_image = rendered_image.clamp(0, 1)
 
-    if opt.include_mask:
+    if include_mask:
         out = {
             "render": rendered_image,
             "mask": mask_image,
@@ -155,6 +171,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             "radii": radii,
             "depth": depth_image
         }
+        if return_alpha:
+            out["alpha"] = mask_image
     else:
         out = {
             "render": rendered_image,

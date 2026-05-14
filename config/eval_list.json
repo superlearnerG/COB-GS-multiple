@@ -1,0 +1,25 @@
+{
+  "datasets": [
+    {
+      "name": "office_desk",
+      "input_path": "../../../siga26/output/office_desk/cobgs/5010000/decouple+inpaint/desk+background/test/render",
+      "GTpath": "../../../siga26/data/office_desk/removal_GT",
+      "mask_dir": "../../../siga26/data/office_desk/object_mask",
+      "mask_values": [17, 34, 51, 68, 85, 102, 119]
+    },
+    {
+      "name": "dining_table",
+      "input_path": "../../../siga26/output/dining_table/cobgs/5010000/decouple+inpaint/desk+background/test/render",
+      "GTpath": "../../../siga26/data/dining_table/removal_GT",
+      "mask_dir": "../../../siga26/data/dining_table/object_mask",
+      "mask_values": [85, 102, 119, 136, 153, 170, 187, 204]
+    },
+    {
+      "name": "bedroom",
+      "input_path": "../../../siga26/output/bedroom/cobgs/5010000/decouple+inpaint/desk+background/test/render",
+      "GTpath": "../../../siga26/data/bedroom/removal_GT",
+      "mask_dir": "../../../siga26/data/bedroom/object_mask",
+      "mask_values": [17, 34, 51, 68, 85, 102, 136, 153]
+    }
+  ]
+}

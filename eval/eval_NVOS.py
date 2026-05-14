@@ -12,6 +12,19 @@ gt_folder_path = os.path.join('/data_nvme/zjx/llff_mask/masks', dataset_name)
 
 pred_folder_path = os.path.join('output', dataset_name_real, 'test/ours_22x/mask_renders', dataset_name)
 
+
+def resolve_pred_mask_path(pred_folder, gt_mask_path):
+    pred_png_files = sorted(f for f in os.listdir(pred_folder) if f.endswith('.png'))
+    gt_name = os.path.basename(gt_mask_path)
+    if gt_name in pred_png_files:
+        return os.path.join(pred_folder, gt_name)
+    if len(pred_png_files) == 1:
+        return os.path.join(pred_folder, pred_png_files[0])
+    raise ValueError(
+        f"Cannot infer prediction mask under {pred_folder}. "
+        f"Expected a mask named {gt_name} or exactly one .png file, found {len(pred_png_files)}."
+    )
+
 # General util function to get the boundary of a binary mask.
 # https://gist.github.com/bowenc0221/71f7a02afee92646ca05efeeb14d687d
 def mask_to_boundary(mask, dilation_ratio=0.02):
@@ -97,7 +110,7 @@ if len(png_files) == 1:
     gt_mask_path = os.path.join(gt_folder_path, png_files[0])
 else:
     raise ValueError("no only png")
-pred_mask_path = os.path.join(pred_folder_path, f'00000.png')
+pred_mask_path = resolve_pred_mask_path(pred_folder_path, gt_mask_path)
 gt_mask = load_mask(gt_mask_path)
 pred_mask = load_mask(pred_mask_path)
 print("GT:  ", gt_mask_path)
